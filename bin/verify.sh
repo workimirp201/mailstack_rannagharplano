@@ -28,11 +28,11 @@ log "etcd (the thing that makes failover automatic)"
 if systemctl is-active --quiet etcd; then
   ETCDCTL_API=3 etcdctl \
     --endpoints="https://${MAIL1_IP}:${ETCD_CLIENT_PORT},https://${MAIL2_IP}:${ETCD_CLIENT_PORT},https://${MAIL3_IP}:${ETCD_CLIENT_PORT}" \
-    --cacert="$TLS_DIR/ca.crt" --cert="$TLS_DIR/node.crt" --key="$TLS_DIR/node.key" \
+    --cacert="$TLS_DIR/ca.crt" \
     endpoint health --cluster -w table 2>&1 | sed 's/^/  /'
   healthy=$(ETCDCTL_API=3 etcdctl \
     --endpoints="https://127.0.0.1:${ETCD_CLIENT_PORT}" \
-    --cacert="$TLS_DIR/ca.crt" --cert="$TLS_DIR/node.crt" --key="$TLS_DIR/node.key" \
+    --cacert="$TLS_DIR/ca.crt" \
     endpoint health --cluster 2>&1 | grep -c 'is healthy')
   if [ "${healthy:-0}" -ge 2 ]; then
     ok "etcd quorum present ($healthy/3 healthy)"
@@ -43,6 +43,16 @@ if systemctl is-active --quiet etcd; then
 fi
 
 # ------------------------------------------------------------------- patroni --
+log "TLS material permissions (this broke etcd once — check it)"
+if [ -f "$TLS_DIR/node.key" ]; then
+  ls -l "$TLS_DIR" | sed 's/^/  /'
+  if id -u etcd >/dev/null 2>&1; then
+    sudo -u etcd test -r "$TLS_DIR/node.key" \
+      && ok "the etcd user can read node.key" \
+      || { warn "the etcd user CANNOT read node.key — run: sudo /opt/mailstack/deploy.sh fix-tls-perms"; FAILED=$((FAILED+1)); }
+  fi
+fi
+
 log "PostgreSQL / Patroni"
 if systemctl is-active --quiet patroni; then
   patronictl -c "$PATRONI_CONFIG" list 2>&1 | sed 's/^/  /'
