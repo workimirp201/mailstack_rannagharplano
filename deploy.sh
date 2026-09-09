@@ -25,6 +25,8 @@
 #     mail2:  ./deploy.sh garage-cluster      -> paste S3 keys into .env everywhere
 #     all:    ./deploy.sh etcd
 #     mail2:  ./deploy.sh etcd-auth           (once, after all three are up)
+#     any:    ./deploy.sh etcd-reset          (only to redo a failed bootstrap)
+#     any:    ./deploy.sh fix-tls-perms      (repair /etc/mailstack/tls ownership)
 #     mail2:  ./deploy.sh patroni             (bootstraps the cluster)
 #     1 & 3:  ./deploy.sh patroni             (clones from the leader)
 #     all:    ./deploy.sh haproxy
@@ -75,7 +77,6 @@ RC_DATA=/var/lib/roundcube
 cmd_gen_secrets() {
   need_root
   [ -f "$ENV_FILE" ] || die "$ENV_FILE not found; cp env.example .env first"
-  load_env
   chmod 600 "$ENV_FILE"; chown root:root "$ENV_FILE"
 
   _set() {
@@ -354,14 +355,39 @@ cmd_pki_import() {
   ok "PKI imported"
 }
 
+# Apply the ownership/permissions every consumer of $TLS_DIR needs.
+#
+# THIS MUST BE IDEMPOTENT AND MUST BE RE-APPLIED AFTER ANY WRITE TO $TLS_DIR.
+# etcd runs as 'etcd' and Patroni runs as 'postgres'; both must be able to
+# traverse the directory, and etcd must be able to read the private key.
+# An earlier version of this script re-ran the install step from the patroni
+# phase, which silently reset the directory and key back to root:root and made
+# a running etcd crash-loop with "permission denied" on node.key.
+_tls_perms() {
+  # The directory listing is not secret; the key inside it is. 0755 keeps
+  # traversal working for every service without widening the key itself.
+  chown root:root "$TLS_DIR"; chmod 0755 "$TLS_DIR"
+  [ -f "$TLS_DIR/ca.crt" ]   && { chown root:root "$TLS_DIR/ca.crt";   chmod 0644 "$TLS_DIR/ca.crt"; }
+  [ -f "$TLS_DIR/node.crt" ] && { chown root:root "$TLS_DIR/node.crt"; chmod 0644 "$TLS_DIR/node.crt"; }
+  if [ -f "$TLS_DIR/node.key" ]; then
+    if id -u etcd >/dev/null 2>&1; then
+      chown root:etcd "$TLS_DIR/node.key"; chmod 0640 "$TLS_DIR/node.key"
+    else
+      chown root:root "$TLS_DIR/node.key"; chmod 0600 "$TLS_DIR/node.key"
+    fi
+  fi
+  return 0
+}
+
 # Place the node's cert/key/CA where PostgreSQL, etcd and the system trust
 # store expect them.
 _pki_install() {
   local n="$1"
-  install -d -m 0750 "$TLS_DIR"
+  install -d -m 0755 "$TLS_DIR"
   install -m 0644 "$PKI_DIR/ca.crt"   "$TLS_DIR/ca.crt"
   install -m 0644 "$PKI_DIR/$n.crt"   "$TLS_DIR/node.crt"
-  install -m 0640 "$PKI_DIR/$n.key"   "$TLS_DIR/node.key"
+  install -m 0600 "$PKI_DIR/$n.key"   "$TLS_DIR/node.key"
+  _tls_perms
 
   # PostgreSQL runs as postgres and refuses a key it does not own.
   if id -u postgres >/dev/null 2>&1; then
@@ -554,8 +580,10 @@ cmd_etcd() {
 
   id -u etcd >/dev/null 2>&1 || useradd --system --home-dir "$ETCD_DATA" --shell /usr/sbin/nologin etcd
   install -d -o etcd -g etcd -m 0700 "$ETCD_DATA"
-  install -d -o root -g etcd -m 0750 "$TLS_DIR"
-  chgrp etcd "$TLS_DIR/node.key" && chmod 0640 "$TLS_DIR/node.key"
+  # Now that the etcd user exists, grant it read on the private key.
+  _tls_perms
+  sudo -u etcd test -r "$TLS_DIR/node.key" \
+    || die "the etcd user cannot read $TLS_DIR/node.key — check ownership: ls -l $TLS_DIR"
 
   local CLUSTER="mail1=https://${MAIL1_IP}:${ETCD_PEER_PORT},mail2=https://${MAIL2_IP}:${ETCD_PEER_PORT},mail3=https://${MAIL3_IP}:${ETCD_PEER_PORT}"
 
@@ -573,15 +601,35 @@ ETCD_INITIAL_ADVERTISE_PEER_URLS=https://${SELF_IP}:${ETCD_PEER_PORT}
 ETCD_LISTEN_CLIENT_URLS=https://0.0.0.0:${ETCD_CLIENT_PORT}
 ETCD_ADVERTISE_CLIENT_URLS=https://${SELF_IP}:${ETCD_CLIENT_PORT}
 
-# Mutual TLS on both peer and client channels, signed by our internal CA.
-ETCD_CERT_FILE=${TLS_DIR}/node.crt
-ETCD_KEY_FILE=${TLS_DIR}/node.key
-ETCD_TRUSTED_CA_FILE=${TLS_DIR}/ca.crt
-ETCD_CLIENT_CERT_AUTH=true
+# --- TLS -------------------------------------------------------------------
+# PEER channel: full mutual TLS. Peers talk native gRPC to each other, so
+# certificate-based authentication works normally here.
 ETCD_PEER_CERT_FILE=${TLS_DIR}/node.crt
 ETCD_PEER_KEY_FILE=${TLS_DIR}/node.key
 ETCD_PEER_TRUSTED_CA_FILE=${TLS_DIR}/ca.crt
 ETCD_PEER_CLIENT_CERT_AUTH=true
+#
+# CLIENT channel: TLS for encryption and server authentication, but
+# ETCD_CLIENT_CERT_AUTH MUST BE false.
+#
+# Why: Patroni's etcd3 driver speaks to etcd's HTTP/JSON gRPC-gateway
+# (the /v3/... endpoints), not native gRPC. With client-cert-auth enabled,
+# etcd derives the username from the client certificate CommonName — but a
+# request arriving through the gateway carries the gateway's own identity,
+# not the caller's. etcd correctly refuses rather than authenticating as the
+# wrong principal, and returns:
+#     "CommonName of client sending a request against gateway will be
+#      ignored and not used as expected"
+# Setting this to true makes Patroni permanently unable to reach etcd.
+#
+# Client authentication is instead provided by etcd RBAC (the 'patroni' user,
+# scoped to the /mailstack/ prefix) plus your firewall allowlist. Traffic is
+# still fully encrypted and Patroni still verifies etcd's server certificate
+# against our CA.
+ETCD_CERT_FILE=${TLS_DIR}/node.crt
+ETCD_KEY_FILE=${TLS_DIR}/node.key
+ETCD_TRUSTED_CA_FILE=${TLS_DIR}/ca.crt
+ETCD_CLIENT_CERT_AUTH=false
 
 # WAN tuning. etcd docs: heartbeat ~0.5-1.5x max RTT, election >= 10x RTT.
 ETCD_HEARTBEAT_INTERVAL=${ETCD_HEARTBEAT_MS}
@@ -605,8 +653,14 @@ User=etcd
 Group=etcd
 EnvironmentFile=/etc/default/etcd
 ExecStart=${ETCD_BIN}
-Restart=on-failure
+# etcd only signals READY once the cluster has formed. During a first
+# bootstrap the other two nodes may be minutes away, so the default 90 s
+# start timeout would kill it, restart it, hit the rate limiter and give up
+# with the port closed. Wait indefinitely instead.
+TimeoutStartSec=0
+Restart=always
 RestartSec=5
+StartLimitIntervalSec=0
 LimitNOFILE=65536
 NoNewPrivileges=true
 ProtectHome=true
@@ -618,45 +672,98 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now etcd
-  sleep 4
-  systemctl is-active --quiet etcd || die "etcd failed: journalctl -u etcd -n 60"
-  ok "etcd running (cluster forms once all three nodes are up)"
+  systemctl reset-failed etcd 2>/dev/null || true
+  systemctl enable etcd
+  systemctl restart etcd
+  sleep 5
+  # "activating" is the correct state on the first node: it is waiting for the
+  # other two before it can signal readiness. Only a dead unit is a failure.
+  case "$(systemctl is-active etcd 2>/dev/null || true)" in
+    active)     ok "etcd running and the cluster has quorum" ;;
+    activating) ok "etcd started, waiting for peers (this is normal until all three are up)" ;;
+    *)          die "etcd failed to start: journalctl -u etcd -n 80 --no-pager" ;;
+  esac
 
   write_file /etc/profile.d/etcdctl.sh 0644 <<EOF
 export ETCDCTL_API=3
 export ETCDCTL_ENDPOINTS=https://127.0.0.1:${ETCD_CLIENT_PORT}
 export ETCDCTL_CACERT=${TLS_DIR}/ca.crt
-export ETCDCTL_CERT=${TLS_DIR}/node.crt
-export ETCDCTL_KEY=${TLS_DIR}/node.key
+# Once RBAC is enabled (deploy.sh etcd-auth) most commands need credentials:
+#   etcdctl --user root:\$(sudo grep '^ETCD_ROOT_PASSWORD=' /opt/mailstack/.env | cut -d= -f2-) ...
 EOF
-  log "Cluster health (expect errors until all three are running):"
+  log "Cluster health (errors here are expected until all three nodes are up):"
   _etcdctl endpoint health --cluster 2>&1 | sed 's/^/    /' || true
 }
 
+# No client certificate: the client channel authenticates with RBAC, not CN.
 _etcdctl() {
   ETCDCTL_API=3 etcdctl \
     --endpoints="https://127.0.0.1:${ETCD_CLIENT_PORT}" \
-    --cacert="$TLS_DIR/ca.crt" --cert="$TLS_DIR/node.crt" --key="$TLS_DIR/node.key" \
-    "$@"
+    --cacert="$TLS_DIR/ca.crt" "$@"
+}
+_etcdctl_root() {
+  ETCDCTL_API=3 etcdctl \
+    --endpoints="https://127.0.0.1:${ETCD_CLIENT_PORT}" \
+    --cacert="$TLS_DIR/ca.crt" --user "root:${ETCD_ROOT_PASSWORD}" "$@"
+}
+
+# Wipe a half-bootstrapped etcd member. Safe before Patroni has bootstrapped —
+# at that point etcd holds no data you cannot recreate. Refuses once Patroni
+# has written cluster state, because then it would be destroying the DCS.
+cmd_etcd_reset() {
+  need_root; load_env
+  if _etcdctl_root get --prefix --keys-only "/mailstack/" 2>/dev/null | grep -q .; then
+    die "etcd already holds Patroni state — resetting would destroy the cluster's DCS.
+     If you really mean it, stop patroni everywhere first and remove $ETCD_DATA by hand."
+  fi
+  log "Stopping etcd and clearing $ETCD_DATA"
+  systemctl stop etcd 2>/dev/null || true
+  if [ -d "$ETCD_DATA/member" ]; then
+    mv "$ETCD_DATA/member" "$ETCD_DATA/member.bak-$(date +%s)"
+    ok "old member directory kept as a .bak alongside it"
+  fi
+  systemctl reset-failed etcd 2>/dev/null || true
+  systemctl start etcd
+  sleep 3
+  ok "etcd restarted with a fresh data directory — run this on ALL THREE nodes, then 'etcd-auth' on mail2"
 }
 
 cmd_etcd_auth() {
   need_root; load_env
   [ "$NODE_NAME" = "mail2" ] || die "run etcd-auth on mail2 only, once"
-  log "Cluster members"
-  _etcdctl member list -w table 2>&1 | sed 's/^/    /'
-  local n; n=$(_etcdctl member list 2>/dev/null | wc -l)
-  [ "$n" -ge 3 ] || die "only $n member(s) visible — start etcd on all three nodes first"
 
-  log "Enabling RBAC (defence in depth on top of mTLS and your firewall)"
-  _etcdctl user add root --new-user-password="$ETCD_ROOT_PASSWORD" 2>/dev/null || warn "root user exists"
-  _etcdctl user add patroni --new-user-password="$ETCD_PATRONI_PASSWORD" 2>/dev/null || warn "patroni user exists"
-  _etcdctl role add patroni 2>/dev/null || true
-  _etcdctl role grant-permission patroni --prefix=true readwrite "/mailstack/" 2>/dev/null || true
-  _etcdctl user grant-role patroni patroni 2>/dev/null || true
-  _etcdctl auth enable 2>/dev/null || warn "auth already enabled"
-  ok "etcd RBAC enabled"
+  log "Cluster members"
+  # member list works unauthenticated before RBAC is on, and needs root after.
+  _etcdctl member list -w table 2>/dev/null || _etcdctl_root member list -w table 2>&1 | sed 's/^/    /'
+  local n
+  n=$( { _etcdctl member list 2>/dev/null || _etcdctl_root member list 2>/dev/null; } \
+        | grep -c 'started' || true )
+  [ "${n:-0}" -ge 3 ] || die "only ${n:-0} member(s) visible — bring etcd up on all three nodes first"
+
+  if _etcdctl_root auth status 2>/dev/null | grep -qi 'Authentication Status: true'; then
+    ok "RBAC already enabled"
+  else
+    log "Creating users and enabling RBAC"
+    # 'root' must exist and hold the root role before auth can be enabled.
+    _etcdctl user add root --new-user-password="$ETCD_ROOT_PASSWORD" 2>/dev/null || warn "root exists"
+    _etcdctl user grant-role root root 2>/dev/null || true
+    _etcdctl user add patroni --new-user-password="$ETCD_PATRONI_PASSWORD" 2>/dev/null || warn "patroni exists"
+    _etcdctl role add patroni 2>/dev/null || true
+    _etcdctl role grant-permission patroni --prefix=true readwrite "/mailstack/" 2>/dev/null || true
+    _etcdctl user grant-role patroni patroni 2>/dev/null || true
+    _etcdctl auth enable || die "could not enable auth"
+    ok "etcd RBAC enabled"
+  fi
+
+  log "Verifying the patroni user can write under /mailstack/"
+  ETCDCTL_API=3 etcdctl --endpoints="https://127.0.0.1:${ETCD_CLIENT_PORT}" \
+    --cacert="$TLS_DIR/ca.crt" --user "patroni:${ETCD_PATRONI_PASSWORD}" \
+    put /mailstack/_selftest ok >/dev/null 2>&1 \
+    && ok "patroni user works" \
+    || die "the patroni user cannot write to /mailstack/ — Patroni will not start"
+  ETCDCTL_API=3 etcdctl --endpoints="https://127.0.0.1:${ETCD_CLIENT_PORT}" \
+    --cacert="$TLS_DIR/ca.crt" --user "patroni:${ETCD_PATRONI_PASSWORD}" \
+    del /mailstack/_selftest >/dev/null 2>&1 || true
 }
 
 
@@ -669,16 +776,32 @@ cmd_patroni() {
               PATRONI_REST_PASSWORD ETCD_PATRONI_PASSWORD
   [ -f "$TLS_DIR/node.crt" ] || die "run pki / pki-import first"
 
+  # Patroni is useless without a working DCS, and the failure mode is a
+  # confusing loop rather than a clear error. Prove etcd works first.
+  log "Checking etcd before installing Patroni"
+  local healthy
+  healthy=$(ETCDCTL_API=3 etcdctl \
+      --endpoints="https://${MAIL1_IP}:${ETCD_CLIENT_PORT},https://${MAIL2_IP}:${ETCD_CLIENT_PORT},https://${MAIL3_IP}:${ETCD_CLIENT_PORT}" \
+      --cacert="$TLS_DIR/ca.crt" endpoint health --cluster 2>&1 | grep -c 'is healthy' || true)
+  [ "${healthy:-0}" -ge 2 ] \
+    || die "only ${healthy:-0}/3 etcd endpoints healthy — no quorum, so Patroni cannot elect a leader.
+     Fix etcd first:  systemctl status etcd ; journalctl -u etcd -n 80 --no-pager"
+  ok "${healthy}/3 etcd endpoints healthy"
+
+  ETCDCTL_API=3 etcdctl --endpoints="https://127.0.0.1:${ETCD_CLIENT_PORT}" \
+      --cacert="$TLS_DIR/ca.crt" --user "patroni:${ETCD_PATRONI_PASSWORD}" \
+      put /mailstack/_selftest ok >/dev/null 2>&1 \
+    || die "the 'patroni' etcd user cannot write to /mailstack/.
+     Run './deploy.sh etcd-auth' on mail2 first, and make sure
+     ETCD_CLIENT_CERT_AUTH=false in /etc/default/etcd on every node."
+  ETCDCTL_API=3 etcdctl --endpoints="https://127.0.0.1:${ETCD_CLIENT_PORT}" \
+      --cacert="$TLS_DIR/ca.crt" --user "patroni:${ETCD_PATRONI_PASSWORD}" \
+      del /mailstack/_selftest >/dev/null 2>&1 || true
+  ok "etcd RBAC accepts the patroni user"
+
   log "Installing PostgreSQL $PG_VERSION and Patroni from PGDG"
   export DEBIAN_FRONTEND=noninteractive
-  if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
-    install -d /usr/share/postgresql-common/pgdg
-    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-      -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
-    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
-      > /etc/apt/sources.list.d/pgdg.list
-    apt-get update -qq
-  fi
+  _pgdg_repo
   apt-get install -y -qq "postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}" patroni
 
   # Debian/Ubuntu creates a cluster on install and manages it with pg_ctlcluster.
@@ -692,6 +815,16 @@ cmd_patroni() {
   systemctl disable --now postgresql 2>/dev/null || true
 
   _pki_install "$NODE_NAME"
+  # Re-installing the TLS material must never disturb a running etcd. Prove it.
+  if id -u etcd >/dev/null 2>&1 && ! sudo -u etcd test -r "$TLS_DIR/node.key"; then
+    die "etcd lost read access to $TLS_DIR/node.key — run: $0 fix-tls-perms"
+  fi
+  if systemctl is-enabled --quiet etcd 2>/dev/null && ! systemctl is-active --quiet etcd; then
+    warn "etcd is not running; restarting it before Patroni"
+    systemctl reset-failed etcd 2>/dev/null || true
+    systemctl restart etcd || true
+    sleep 5
+  fi
 
   local DATA_DIR="/var/lib/postgresql/${PG_VERSION}/main"
   install -d -o postgres -g postgres -m 0700 "$DATA_DIR"
@@ -723,9 +856,13 @@ etcd3:
   - ${MAIL3_IP}:${ETCD_CLIENT_PORT}
   username: patroni
   password: ${ETCD_PATRONI_PASSWORD}
+  # cacert only — deliberately NO client cert/key here.
+  # Patroni reaches etcd through its HTTP/JSON gRPC-gateway. A client
+  # certificate presented there cannot carry the caller's identity, and etcd
+  # rejects the request with "CommonName of client sending a request against
+  # gateway will be ignored". Authentication is the username/password above,
+  # backed by etcd RBAC scoped to /mailstack/.
   cacert: ${TLS_DIR}/ca.crt
-  cert: ${TLS_DIR}/node.crt
-  key: ${TLS_DIR}/node.key
 
 bootstrap:
   dcs:
@@ -879,6 +1016,47 @@ EOF
     log "Creating application roles and databases (only needed once)"
     _patroni_bootstrap_roles
   fi
+}
+
+# Configure the PostgreSQL community (PGDG) apt repository.
+#
+# The signing key MUST be stored dearmoured (binary .gpg), not as the ASCII
+# armoured .asc it is published as. An earlier version of this script pointed
+# signed-by= straight at the .asc, which makes apt fall back to apt-key and
+# fail with the unhelpful:
+#     Err: ... InRelease  Unknown error executing apt-key
+#     E: The repository ... is not signed.
+# `gpg --dearmor` is the fix, and it is what the PostgreSQL project documents.
+_pgdg_repo() {
+  local keydir=/usr/share/postgresql-common/pgdg
+  local keyring="$keydir/apt.postgresql.org.gpg"
+  local listf=/etc/apt/sources.list.d/pgdg.list
+  local codename; codename=$(. /etc/os-release; echo "${VERSION_CODENAME:-noble}")
+
+  command -v gpg >/dev/null 2>&1 || apt-get install -y -qq gnupg
+  install -d -m 0755 "$keydir"
+
+  if [ ! -s "$keyring" ]; then
+    log "Fetching and dearmouring the PGDG signing key"
+    # Clean up any half-written or armoured leftovers first.
+    rm -f "$keydir"/apt.postgresql.org.asc "$keyring"
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+      | gpg --dearmor -o "$keyring" \
+      || die "could not fetch/dearmour the PGDG key — check outbound HTTPS to postgresql.org"
+    chmod 0644 "$keyring"
+    [ -s "$keyring" ] || die "PGDG keyring is empty: $keyring"
+  fi
+
+  local want="deb [signed-by=${keyring}] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main"
+  if [ "$(cat "$listf" 2>/dev/null)" != "$want" ]; then
+    printf '%s\n' "$want" > "$listf"
+    chmod 0644 "$listf"
+    log "Wrote $listf for ${codename}-pgdg"
+  fi
+
+  apt-get update -qq \
+    || die "apt-get update failed after adding PGDG. Inspect with:  apt-get update  (no -qq)"
+  ok "PGDG repository ready"
 }
 
 _patroni_bootstrap_roles() {
@@ -1387,6 +1565,28 @@ EOF
 # =============================================================================
 #  status
 # =============================================================================
+# Repair $TLS_DIR ownership without touching anything else. Safe any time.
+cmd_fix_tls_perms() {
+  need_root; load_env
+  _tls_perms
+  ls -l "$TLS_DIR" | sed 's/^/    /'
+  if id -u etcd >/dev/null 2>&1; then
+    sudo -u etcd test -r "$TLS_DIR/node.key" \
+      && ok "the etcd user can read node.key" \
+      || die "the etcd user still cannot read node.key"
+  fi
+  if systemctl is-enabled --quiet etcd 2>/dev/null; then
+    systemctl reset-failed etcd 2>/dev/null || true
+    systemctl restart etcd
+    sleep 4
+    case "$(systemctl is-active etcd 2>/dev/null || true)" in
+      active)     ok "etcd is running" ;;
+      activating) ok "etcd started, waiting for peers" ;;
+      *)          warn "etcd still not up: journalctl -u etcd -n 60 --no-pager" ;;
+    esac
+  fi
+}
+
 cmd_status() {
   load_env
   printf '\n=== %s (%s / %s) ===\n\n' "$NODE_NAME" "$SELF_HOST" "$SELF_IP"
@@ -1422,6 +1622,8 @@ main() {
     garage-cluster) cmd_garage_cluster ;;
     etcd)           cmd_etcd ;;
     etcd-auth)      cmd_etcd_auth ;;
+    etcd-reset)     cmd_etcd_reset ;;
+    fix-tls-perms)  cmd_fix_tls_perms ;;
     patroni)        cmd_patroni ;;
     haproxy)        cmd_haproxy ;;
     stalwart)       cmd_stalwart ;;
