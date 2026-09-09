@@ -75,6 +75,7 @@ RC_DATA=/var/lib/roundcube
 cmd_gen_secrets() {
   need_root
   [ -f "$ENV_FILE" ] || die "$ENV_FILE not found; cp env.example .env first"
+  load_env
   chmod 600 "$ENV_FILE"; chown root:root "$ENV_FILE"
 
   _set() {
